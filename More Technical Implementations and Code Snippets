@@ -1,0 +1,132 @@
+## Technical Implementation
+
+The following code excerpts are taken directly from the production codebase and represent the complete set of `message.content` access points.
+
+### The Command Gate (`bot.js`)
+
+This is the only location where `message.content` is read to classify a message as a command or ambient chat.
+
+```js
+const isCommand = message.content.startsWith(prefix) &&
+  message.content.length > prefix.length &&
+  message.content[prefix.length] !== ' ';
+
+if (!isCommand) {
+  utils.scheduleSpawnForChannel(message.channel, message.author.id).catch(() => {});
+  return;
+}
+
+const args = message.content.slice(prefix.length).trim().split(/ +/);
+const command = args.shift().toLowerCase();
+// message.content is not referenced again after this point
+```
+
+Five and only five operations are performed on `message.content` in the entire codebase:
+
+1. `.trim()` to check for a bare bot @mention and reply with the current server prefix
+2. `.startsWith(prefix)` to detect command intent
+3. `.length > prefix.length` to reject bare prefix input
+4. `[prefix.length] !== ' '` to reject false positives such as `. hello` vs `.hello`
+5. `.slice(prefix.length).trim().split(/ +/)` to extract the command name and arguments
+
+No other file in the codebase reads `message.content`.
+
+### Spawn Scheduling (`src/utils/scheduleSpawnForChannel.js`)
+
+```js
+async function scheduleSpawnForChannel(channel, triggerUserId = null) {
+  if (!channel.guild) return; // DMs excluded entirely
+  const timeSinceLastSpawn = now - lastSpawn;
+  let requiredCooldown = global.SPAWN_COOLDOWN_MS || 120000; // Default 2 minutes
+  if (timeSinceLastSpawn >= requiredCooldown) {
+    await createSpawn(targetChannel, null, null, null, triggerUserId);
+  }
+}
+```
+
+Spawns are guild-only, channel-specific, and cooldown-gated. The triggering user's ID is used only to check their favorites list for a spawn bias roll (a single database read: `SELECT guest_id FROM user_favorites WHERE user_id = $1 LIMIT 1`). The user's message activity is not recorded.
+
+### Claim Name Matching (`src/commands/claim.js`)
+
+```js
+const userInput = args.join(' ');
+const reversedInput = [...args].reverse().join(' ');
+const normalize = s => s.replace(/[^a-zA-Z\s]/g, '').toLowerCase();
+const spawnNameNorm = normalize(channelSpawn.characterName);
+const inputNorm = normalize(userInput);
+const distance = levenshteinDistance(inputNorm, spawnNameNorm);
+if (distance === 1) return message.reply({ content: 'Incorrect name, you are 1 letter off.' });
+```
+
+### Client Configuration and Cache Limits (`bot.js`)
+
+```js
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMembers,
+  ],
+  makeCache: Options.cacheWithLimits({
+    MessageManager: 100,  // Hard limit: max 100 messages cached per channel
+    ReactionManager: 0,   // Reactions not cached at all
+  }),
+  sweepers: {
+    messages: {
+      interval: 300,   // Sweep every 5 minutes
+      lifetime: 600,   // Purge messages older than 10 minutes
+    },
+  },
+});
+```
+
+The message cache is hard-limited to 100 messages per channel. Reactions are not cached. Cache sweeping runs every 5 minutes and purges messages older than 10 minutes.
+
+### `messageDelete` Handler Does Not Read Content (`bot.js`)
+
+```js
+client.on('messageDelete', async (message) => {
+  const channelSpawn = settings.channelSpawns[message.channel.id];
+  if (channelSpawn && channelSpawn.messageId === message.id) {
+    delete settings.channelSpawns[message.channel.id];
+  }
+});
+```
+
+The delete handler checks only `message.id` to clean up spawn state when a moderator removes a spawn embed. `message.content` is not accessed.
+
+---
+
+## Data Handling
+
+**What is stored:** Discord user IDs as the primary key for all game data. Gameplay stats, character ownership, guild membership, and game progression state. One `TEXT` field (`reminders.message`) stores user-authored reminder labels submitted explicitly via `.remindme`. This field is bounded at 200 characters, capped at 25 active reminders per user, and deletable at any time.
+
+**What is not stored:** Message content of any kind. No message text, chat history, or chat logs exist anywhere in the schema. The PostgreSQL schema (`database/schema.js`) contains no columns for `message_content`, `chat_log`, `user_message`, or any equivalent field. The `message.content` string is read transiently in the event handler and is never written to any database, file, or log.
+
+**What message content is never used for:** Sentiment analysis, keyword filtering, natural language processing, AI or ML training, advertising, analytics, or transmission to any third-party service or API. The bot contains no ML or AI components.
+
+**Explicit commitments:**
+
+- Message content is not stored in any database or log.
+- Message content is not transmitted to any external service or API.
+- Message content is not used for sentiment analysis, keyword filtering, advertising, AI training, or any ML purpose.
+- Message content is not shared with any third party.
+- The user's act of sending a chat message is not recorded or tracked in any form.
+
+---
+
+## Privacy Controls
+
+**Channel restriction.** The spawn system activates only in channels explicitly designated by server administrators via `.setspawnchannel`. Messages in all other channels are processed identically (prefix check only) with no spawn scheduling or recording.
+
+**Server blacklist.** A full server blacklist is maintained. Blacklisted servers receive no responses from the bot.
+
+**Message cache limits.** The message cache is hard-limited to 100 messages per channel with automatic sweeping every 5 minutes and a 10-minute maximum message lifetime.
+
+**No DM monitoring.** The spawn system explicitly exits early for DM channels (`if (!channel.guild) return`). The bot does not monitor DMs unless a user directly addresses it.
+
+**Account deletion.** Users can request complete data deletion through the Eroth support server. Deletion removes all records across every table keyed to the user's Discord ID: profile, characters, guild membership, trade history, reminders, wishlist, favorites, tags, titles, dungeon history, gear, and all related records.
+
+**Database encryption.** The PostgreSQL database is hosted on Railway with encrypted storage volumes at rest.
